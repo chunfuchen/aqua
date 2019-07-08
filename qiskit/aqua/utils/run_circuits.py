@@ -24,7 +24,9 @@ from qiskit import compiler
 from qiskit.assembler import assemble_circuits
 from qiskit.providers import BaseBackend, JobStatus, JobError
 from qiskit.providers.basicaer import BasicAerJob
+from qiskit.providers.jobstatus import JOB_FINAL_STATES
 from qiskit.qobj import QobjHeader
+
 from qiskit.aqua.aqua_error import AquaError
 from qiskit.aqua.utils import summarize_circuits
 from qiskit.aqua.utils.backend_utils import (is_aer_provider,
@@ -242,22 +244,51 @@ def compile_circuits(circuits, backend, backend_config=None, compile_config=None
 
 
 def _safe_submit_qobj(qobj, backend, backend_options, noise_config, skip_qobj_validation):
-    # assure get job ids
+    # assure get job ids, which means the job is submitted successfully.
     while True:
         job = run_on_backend(backend, qobj, backend_options=backend_options, noise_config=noise_config,
                              skip_qobj_validation=skip_qobj_validation)
-        try:
-            job_id = job.job_id()
-            break
-        except JobError as e:
-            logger.warning("FAILURE: Can not get job id, Resubmit the qobj to get job id."
-                           "Terra job error: {} ".format(e))
-        except Exception as e:
-            logger.warning("FAILURE: Can not get job id, Resubmit the qobj to get job id."
-                           "Error: {} ".format(e))
+        msg = "FAILURE: Encounter error during submitting the qobj. Will resubmit it. "
+        if is_ibmq_provider(backend):
+            from qiskit.providers.ibmq.api import ApiError
+            try:
+                job_id = job.job_id()
+                break
+            except ApiError as e:
+                logger.warning(msg + "IBMQ api error: {} ".format(e))
+            except JobError as e:
+                logger.warning(msg + "Terra job error: {} ".format(e))
+            except Exception as e:
+                logger.warning(msg + "Unknown error: {} ".format(e))
+        else:
+            try:
+                job_id = job.job_id()
+                break
+            except JobError as e:
+                logger.warning(msg + "Terra job error: {} ".format(e))
+            except Exception as e:
+                logger.warning(msg + "Unknown error: {} ".format(e))
+        time.sleep(5)
 
     return job, job_id
 
+
+def _safe_get_job_status(job, job_id):
+
+    while True:
+        try:
+            job_status = job.status()
+            break
+        except JobError as e:
+            logger.warning("FAILURE: job id: {}, "
+                           "status: 'FAIL_TO_GET_STATUS' "
+                           "Terra job error: {}".format(job_id, e))
+            time.sleep(5)
+        except Exception as e:
+            raise AquaError("FAILURE: job id: {}, "
+                            "status: 'FAIL_TO_GET_STATUS' "
+                            "Unknown error: ({})".format(job_id, e)) from e
+    return job_status
 
 def run_qobjs(qobjs, backend, qjob_config=None, backend_options=None,
               noise_config=None, skip_qobj_validation=False):
@@ -308,55 +339,47 @@ def run_qobjs(qobjs, backend, qjob_config=None, backend_options=None,
             while True:
                 logger.info("Running {}-th qobj, job id: {}".format(idx, job_id))
                 # try to get result if possible
-                try:
-                    result = job.result(**qjob_config)
-                    if result.success:
-                        results.append(result)
-                        logger.info("COMPLETED the {}-th qobj, "
-                                    "job id: {}".format(idx, job_id))
-                        break
-                    else:
-                        logger.warning("FAILURE: the {}-th qobj, "
-                                       "job id: {}".format(idx, job_id))
-                except JobError as e:
-                    # if terra raise any error, which means something wrong, re-run it
-                    logger.warning("FAILURE: the {}-th qobj, job id: {} "
-                                   "Terra job error: {} ".format(idx, job_id, e))
-                except Exception as e:
-                    raise AquaError("FAILURE: the {}-th qobj, job id: {} "
-                                    "Unknown error: {} ".format(idx, job_id, e)) from e
-
-                # something wrong here if reach here, querying the status to check how to handle it.
-                # keep qeurying it until getting the status.
                 while True:
-                    try:
-                        job_status = job.status()
+                    job_status = _safe_get_job_status(job, job_id)
+                    queue_position = 0
+                    if job_status in JOB_FINAL_STATES:
+                        # do callback again after the job is in the final states
                         break
-                    except JobError as e:
-                        logger.warning("FAILURE: job id: {}, "
-                                       "status: 'FAIL_TO_GET_STATUS' "
-                                       "Terra job error: {}".format(job_id, e))
-                        time.sleep(5)
-                    except Exception as e:
-                        raise AquaError("FAILURE: job id: {}, "
-                                        "status: 'FAIL_TO_GET_STATUS' "
-                                        "Unknown error: ({})".format(job_id, e)) from e
+                    elif job_status == JobStatus.QUEUED:
+                        queue_position = job.queue_position()
+                        logger.info("Job id: {} is queued at position {}".format(job_id, queue_position))
+                    else:
+                        logger.info("Job id: {}, status: {}".format(job_id, job_status))
+                    time.sleep(qjob_config['wait'])
 
-                logger.info("Job status: {}".format(job_status))
-
-                # handle the failure job based on job status
+                # get result after the status is DONE
                 if job_status == JobStatus.DONE:
-                    logger.info("Job ({}) is completed anyway, retrieve result "
-                                "from backend.".format(job_id))
-                    job = backend.retrieve_job(job_id)
-                elif job_status == JobStatus.RUNNING or job_status == JobStatus.QUEUED:
-                    logger.info("Job ({}) is {}, but encounter an exception, "
-                                "recover it from backend.".format(job_id, job_status))
-                    job = backend.retrieve_job(job_id)
+                    while True:
+                        result = job.result(**qjob_config)
+                        if result.success:
+                            results.append(result)
+                            logger.info("COMPLETED the {}-th qobj, job id: {}".format(idx, job_id))
+                            break
+                        else:
+                            logger.warning("FAILURE: Job id: {}".format(job_id))
+                            logger.warning("Job ({}) is completed anyway, retrieve result "
+                                           "from backend again.".format(job_id))
+                            job = backend.retrieve_job(job_id)
+                    break
+                # for other cases, resumbit the qobj until the result is available.
+                # since if there is no result returned, there is no way algorithm can do any process
                 else:
-                    logger.info("Fail to run Job ({}), resubmit it.".format(job_id))
-                    qobj = qobjs[idx]
-                    #  assure job get its id
+                    # get back the qobj first to avoid for job is consumed
+                    qobj = job.qobj()
+                    if job_status == JobStatus.CANCELLED:
+                        logger.warning("FAILURE: Job id: {} is cancelled. Re-submit the Qobj.".format(job_id))
+                    elif job_status == JobStatus.ERROR:
+                        logger.warning("FAILURE: Job id: {} encounters the error. "
+                                       "Error is : {}. Re-submit the Qobj.".format(job_id, job.error_message()))
+                    else:
+                        logging.warning("FAILURE: Job id: {}. Unknown status: {}. "
+                                        "Re-submit the Qobj.".format(job_id, job_status))
+
                     job, job_id = _safe_submit_qobj(qobj, backend, backend_options, noise_config, skip_qobj_validation)
                     jobs[idx] = job
                     job_ids[idx] = job_id
